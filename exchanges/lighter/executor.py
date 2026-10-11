@@ -121,6 +121,20 @@ class Executor:
             )
             err = client.check_client()
             if err is not None:
+                # SignerClient creates an aiohttp session during construction.
+                # CheckClient is synchronous, so schedule its async cleanup
+                # before propagating the credential error; otherwise every
+                # fill-feed retry leaks one ClientSession.
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    close = getattr(client, "close", None)
+                    if callable(close):
+                        result = close()
+                        if asyncio.iscoroutine(result):
+                            loop.create_task(result)
                 raise RuntimeError(f"Lighter CheckClient error: {err}")
             self._client = client
         return self._client
@@ -521,7 +535,11 @@ class Executor:
                 return
             except Exception as exc:
                 if not self._fill_feed_stop:
-                    self._log.warning("Lighter fill-feed disconnected, retrying: %s", exc)
+                    self._log.warning(
+                        "Lighter fill-feed disconnected, retrying "
+                        "(REST=%s WS=%s signing_chain_id=%s): %s",
+                        self._base_url, LIGHTER_WS_URL, LIGHTER_CHAIN_ID, exc,
+                    )
             if not self._fill_feed_stop:
                 await asyncio.sleep(1.0)
 
