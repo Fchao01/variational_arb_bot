@@ -111,6 +111,7 @@ python main.py --record   # 只录制，轮询 ASSETS，绝不下单
 
 调参分两层：运行参数全在 `live_config.json`（改完存盘下一 tick 即生效），结构性参数
 （币种 `ASSETS`、EWMA、RFQ 节奏）在 `arb_bot/config.py`（改了要重启）。详见上方「两套参数」。
+参数逐项说明以及与 entropy-arb 的移植差异见 [`live_config说明.md`](live_config说明.md)。
 
 ### 输出
 - `./log/runtime.log`：唯一运行日志（同时回显到终端）

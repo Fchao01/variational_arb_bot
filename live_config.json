@@ -9,5 +9,6 @@
   "max_slippage_bps": 10.0,
   "lighter_slippage_bps": 30.0,
   "net_tolerance_base": 0.001,
-  "reconcile_seconds": 15.0
+  "reconcile_seconds": 15.0,
+  "_说明": "JSON 不支持注释；参数说明和与 entropy-arb 的对应关系见 live_config说明.md"
 }
