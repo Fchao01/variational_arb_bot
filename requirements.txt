@@ -1,5 +1,6 @@
 websockets>=12.0,<15.0
 python-dotenv>=1.0.1,<2.0
 requests==2.32.5
-lighter-sdk==1.0.4
+# RH/Robinhood Chain support and the 466324 signing domain were added in 1.1.2.
+lighter-sdk>=1.1.2,<1.2.0
 rich>=13.7.1,<14.0

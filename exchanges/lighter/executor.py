@@ -23,6 +23,7 @@ import websockets
 from lighter.signer_client import SignerClient
 
 from arb_bot.config import (
+    LIGHTER_CHAIN_ID,
     LIGHTER_WS_PING_INTERVAL_SECONDS,
     LIGHTER_WS_PING_TIMEOUT_SECONDS,
     LIGHTER_WS_URL,
@@ -111,6 +112,7 @@ class Executor:
                 url=self._base_url,
                 account_index=required_int_env("LIGHTER_ACCOUNT_INDEX"),
                 api_private_keys={required_int_env("LIGHTER_API_KEY_INDEX"): key},
+                chain_id=LIGHTER_CHAIN_ID,
             )
             err = client.check_client()
             if err is not None:
@@ -208,8 +210,8 @@ class Executor:
                 reduce_only,
                 client.NIL_TRIGGER_PRICE,
                 client.DEFAULT_28_DAY_ORDER_EXPIRY,
-                nonce,
-                api_key_index,
+                nonce=nonce,
+                api_key_index=api_key_index,
             )
             if sign_err is not None:
                 client.nonce_manager.acknowledge_failure(api_key_index)

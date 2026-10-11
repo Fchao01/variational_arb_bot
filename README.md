@@ -57,7 +57,7 @@ py -3 -m venv .venv
 pip install -r requirements.txt
 ```
 
-复制 `.env.example` 为 `.env` 并填入 Lighter 信息：
+复制 `.env.example` 为 `.env` 并填入 Lighter RH（Robinhood Chain）信息：
 ```bash
 cp .env.example .env
 # 然后编辑 .env 填入：
@@ -65,6 +65,15 @@ cp .env.example .env
 # LIGHTER_API_KEY_INDEX=...
 # LIGHTER_PRIVATE_KEY=...
 ```
+
+本项目的 Lighter 腿固定连接 RH 链：
+
+- REST：`https://api.rh.lighter.xyz`
+- WebSocket：`wss://api.rh.lighter.xyz/stream`
+- L2 signing chain id：`466324`
+- 结算资产：RH 侧使用 USDG
+
+RH 与 Lighter Core 主网是独立部署，不能复用主网的账户、API key、市场 ID 或资金。
 
 如需在 Lighter WebSocket 新旧逻辑切换期间临时强制使用旧的应用层 ping/pong，可设置：
 ```bash

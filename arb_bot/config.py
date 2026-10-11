@@ -20,8 +20,12 @@ ROUNDS_DIAG_CSV_FILE = DOCS_DIR / "rounds_diag.csv"
 READY_TIMEOUT_SECONDS = 60.0
 POLL_INTERVAL_SECONDS = 0.05
 
-LIGHTER_BASE_URL = "https://mainnet.zklighter.elliot.ai"
-LIGHTER_WS_URL = "wss://mainnet.zklighter.elliot.ai/stream"
+# Lighter Robinhood Chain deployment (RH), not Lighter Core mainnet.
+# RH has a separate account/API-key namespace and uses a different L2 signing
+# domain. Do not mix credentials or market metadata with the Core deployment.
+LIGHTER_BASE_URL = "https://api.rh.lighter.xyz"
+LIGHTER_WS_URL = "wss://api.rh.lighter.xyz/stream"
+LIGHTER_CHAIN_ID = 466324
 LIGHTER_WS_PING_INTERVAL_SECONDS = 30
 LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 
