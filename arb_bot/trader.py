@@ -17,7 +17,7 @@ import asyncio
 import logging
 import re
 import time
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from typing import Any
 
 from arb_bot.basis import BasisStrategy
@@ -60,6 +60,300 @@ class Trader:
 
         self.halted = False
         self._last_hedge_block_log = 0.0
+
+    async def run_arb(
+        self,
+        var_asset: str,
+        lighter_symbol: str,
+        quote: Quote,
+        direction: str,
+        edge_bps: float,
+        lighter_bid: Decimal,
+        lighter_ask: Decimal,
+        t_signal: float | None = None,
+        lt_book_at: float = 0.0,
+        lt_server_at: float = 0.0,
+        t_decision: float = 0.0,
+        wall_decision: float = 0.0,
+    ) -> bool:
+        """Execute one entropy-style two-leg slice.
+
+        Unlike ``run_round``, this method never waits for a z-score exit and
+        never assumes the two fills are identical. It rolls back a successful
+        leg when the other leg fails, then reconciles both venue positions and
+        sends a reduce-only hedge for any residual net base exposure.
+        """
+        qty = quote.qty
+        var_side = "buy" if direction == "long_var" else "sell"
+        lighter_side = "SELL" if direction == "long_var" else "BUY"
+        hedge_ref_price = lighter_bid if lighter_side == "SELL" else lighter_ask
+        blocked = self._lighter.hedge_blocked(
+            lighter_symbol, qty, hedge_ref_price
+        )
+        if blocked:
+            now = time.monotonic()
+            if now - self._last_hedge_block_log >= 30.0:
+                self._log.warning(
+                    "%s %s qty=%s SKIPPED — Lighter leg blocked: %s",
+                    var_asset, direction, qty, blocked,
+                )
+                self._last_hedge_block_log = now
+            return False
+
+        if t_signal is None:
+            t_signal = time.monotonic()
+        var_status: str
+        var_info: Any
+        lighter_status: str
+        lighter_info: Any
+
+        async def place_var() -> tuple[str, Any]:
+            try:
+                resp = await self._command.place_order(
+                    side=var_side,
+                    amount=str(qty),
+                    market=var_asset,
+                    order_type="market",
+                    max_slippage=self._live.max_slippage_bps / 10000.0,
+                    reduce_only=False,
+                    reuse_quote_id=quote.quote_id,
+                )
+            except Exception as exc:
+                return "err", exc
+            if resp.get("ok"):
+                return "ok", quote.ask if var_side == "buy" else quote.bid
+            result = (resp.get("result") if isinstance(resp, dict) else None) or {}
+            return "reject", str(resp.get("error") or result.get("error") or "")
+
+        async def place_lighter() -> tuple[str, Any]:
+            try:
+                order_id, _ = await self._lighter.submit(
+                    lighter_symbol,
+                    lighter_side,
+                    qty,
+                    lighter_bid,
+                    lighter_ask,
+                    reduce_only=False,
+                )
+            except Exception as exc:
+                return "err", exc
+            if await self._lighter_filled(lighter_symbol, order_id):
+                return "ok", order_id
+            return "unfilled", f"order {order_id} unfilled"
+
+        # Both legs are submitted concurrently. Sequential submission would
+        # turn the quoted cross-venue edge into avoidable naked-leg exposure.
+        (var_status, var_info), (lighter_status, lighter_info) = await asyncio.gather(
+            place_var(), place_lighter()
+        )
+        var_ok = var_status == "ok"
+        lighter_ok = lighter_status == "ok"
+
+        if var_ok and not lighter_ok:
+            self._log.error(
+                "%s: Lighter leg failed after Variational fill (%s) — rollback",
+                var_asset, lighter_info,
+            )
+            await self._rollback_var(var_asset, var_side, qty)
+            return False
+        if lighter_ok and not var_ok:
+            self._log.error(
+                "%s: Variational leg failed after Lighter fill (%s) — rollback",
+                var_asset, var_info,
+            )
+            await self._rollback_lighter(
+                lighter_symbol, lighter_side, qty, lighter_bid, lighter_ask
+            )
+            return False
+        if not var_ok and not lighter_ok:
+            self._log.warning(
+                "%s: both arb legs failed (var=%s lighter=%s)",
+                var_asset, var_info, lighter_info,
+            )
+            return False
+
+        self._log.info(
+            "ARB %s %s qty=%s edge=%+.2fbps var=%s lighter_order=%s "
+            "submit_lag=%dms",
+            var_asset,
+            direction,
+            qty,
+            edge_bps,
+            var_side,
+            lighter_info,
+            int((time.monotonic() - t_signal) * 1000),
+        )
+        # Give the Var events stream a short chance to publish the fill before
+        # the immediate reconciliation. The periodic reconciliation below is
+        # still authoritative if this event arrives later.
+        await asyncio.sleep(0.1)
+        await self.reconcile_and_hedge(var_asset, lighter_symbol)
+        return True
+
+    async def reconcile_and_hedge(
+        self, var_asset: str, lighter_symbol: str
+    ) -> bool:
+        """Read both signed positions and reduce any net base exposure.
+
+        Positive net means the combined account is long and needs a SELL on a
+        venue that is carrying a long. Negative net needs a BUY against a
+        short. Only the venue carrying the imbalance is touched, and every
+        hedge order is reduce-only.
+        """
+        var_task = asyncio.create_task(self._fetch_var_position(var_asset))
+        lighter_task = asyncio.create_task(
+            self._lighter.fetch_position(lighter_symbol)
+        )
+        var_result, lighter_result = await asyncio.gather(
+            var_task, lighter_task, return_exceptions=True
+        )
+        if isinstance(var_result, Exception):
+            self._log.warning("%s Var position read failed: %s", var_asset, var_result)
+            return False
+        if isinstance(lighter_result, Exception):
+            self._log.warning(
+                "%s Lighter position read failed: %s", lighter_symbol, lighter_result
+            )
+            return False
+        var_pos = var_result
+        lighter_pos = lighter_result
+        net = var_pos + lighter_pos
+        tolerance = Decimal(str(self._live.net_tolerance_base))
+        if abs(net) <= tolerance:
+            return True
+
+        want_sign = Decimal("1") if net > 0 else Decimal("-1")
+        candidates: list[tuple[str, Decimal]] = []
+        if var_pos * want_sign > 0:
+            candidates.append(("var", abs(var_pos)))
+        if lighter_pos * want_sign > 0:
+            candidates.append(("lighter", abs(lighter_pos)))
+        if not candidates:
+            self._log.error(
+                "%s net exposure=%s but neither venue has a reducible same-sign position "
+                "(var=%s lighter=%s)",
+                var_asset, net, var_pos, lighter_pos,
+            )
+            return False
+
+        venue, carrying = max(candidates, key=lambda item: item[1])
+        qty = min(abs(net), carrying)
+        if venue == "var":
+            qty = self._quotes.align_qty(var_asset, qty)
+        else:
+            cfg = self._lighter.config(lighter_symbol)
+            if cfg is not None and cfg.base_mult > 0:
+                qty = (
+                    (qty * cfg.base_mult).to_integral_value(rounding=ROUND_DOWN)
+                    / Decimal(cfg.base_mult)
+                )
+        if qty <= 0:
+            self._log.warning(
+                "%s residual net=%s rounds to zero at %s precision "
+                "(var=%s lighter=%s)",
+                var_asset, net, venue, var_pos, lighter_pos,
+            )
+            return False
+
+        hedge_side = "SELL" if net > 0 else "BUY"
+        self._log.warning(
+            "HEDGE %s net=%s var=%s lighter=%s venue=%s side=%s qty=%s",
+            var_asset, net, var_pos, lighter_pos, venue, hedge_side, qty,
+        )
+        if venue == "var":
+            resp = await self._command.place_order(
+                side=hedge_side.lower(),
+                amount=str(qty),
+                market=var_asset,
+                order_type="market",
+                max_slippage=self._live.max_slippage_bps / 10000.0,
+                reduce_only=True,
+            )
+            if not resp.get("ok"):
+                self._log.error("%s Variational hedge failed: %s", var_asset, resp)
+                self.halted = True
+                return False
+            return True
+
+        bid, ask, _, _ = await self.lighter_book.get_book(lighter_symbol)
+        if bid is None or ask is None or bid <= 0 or ask <= 0:
+            self._log.error("%s cannot hedge: Lighter book unavailable", var_asset)
+            return False
+        blocked = self._lighter.hedge_blocked(
+            lighter_symbol, qty, bid if hedge_side == "SELL" else ask
+        )
+        if blocked:
+            self._log.warning(
+                "%s residual hedge below Lighter constraints: %s", var_asset, blocked
+            )
+            return False
+        try:
+            order_id, _ = await self._lighter.submit(
+                lighter_symbol, hedge_side, qty, bid, ask, reduce_only=True
+            )
+            if not await self._lighter_filled(lighter_symbol, order_id):
+                self._log.error(
+                    "%s Lighter hedge order %s did not fill; halting", var_asset, order_id
+                )
+                self.halted = True
+                return False
+        except Exception as exc:
+            self._log.error("%s Lighter hedge failed: %s — halting", var_asset, exc)
+            self.halted = True
+            return False
+        return True
+
+    async def _fetch_var_position(self, asset: str) -> Decimal:
+        """Read a signed Variational position, with WS monitor fallback."""
+        try:
+            resp = await self._command.positions(timeout=10.0)
+            if resp.get("ok"):
+                parsed = self._position_from_payload(resp.get("positions"), asset)
+                if parsed is not None:
+                    return parsed
+        except Exception as exc:
+            self._log.warning("%s Var POSITIONS query failed: %s", asset, exc)
+        state = await self._monitor.get_trading_state()
+        row = state.get("position_row") if state.get("asset") == asset else None
+        if isinstance(row, dict):
+            qty = to_decimal(row.get("qty"))
+            if qty is not None:
+                return qty
+        return Decimal("0")
+
+    @staticmethod
+    def _position_from_payload(payload: Any, asset: str) -> Decimal | None:
+        """Parse the several `/api/positions` envelope shapes seen in Var."""
+        want = asset.upper()
+
+        def walk(value: Any) -> Decimal | None:
+            if isinstance(value, list):
+                for item in value:
+                    found = walk(item)
+                    if found is not None:
+                        return found
+                return None
+            if not isinstance(value, dict):
+                return None
+            info = value.get("position_info")
+            instrument = value.get("instrument")
+            if not isinstance(instrument, dict) and isinstance(info, dict):
+                instrument = info.get("instrument")
+            underlying = instrument.get("underlying") if isinstance(instrument, dict) else None
+            if str(underlying or "").upper() == want:
+                raw_qty = value.get("qty")
+                if raw_qty is None and isinstance(info, dict):
+                    raw_qty = info.get("qty")
+                qty = to_decimal(raw_qty)
+                if qty is not None:
+                    return qty
+            for child in value.values():
+                found = walk(child)
+                if found is not None:
+                    return found
+            return None
+
+        return walk(payload)
 
     async def run_round(
         self,

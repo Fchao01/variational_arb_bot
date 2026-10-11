@@ -45,5 +45,5 @@ BASIS_SIGMA_FLOOR_BPS = float(os.getenv("BASIS_SIGMA_FLOOR_BPS", "0.3"))  # supp
 RFQ_MIN_INTERVAL_MS = 500.0
 FILL_WAIT_SECONDS = 5.0          # bounded wait for real fill prices before fallback
 
-# Z_ENTRY/Z_EXIT/Z_STOP, MAX_HOLD_SECONDS, RFQ_NOTIONAL_USDC, MAX_TRADES_PER_RUN,
-# MAX_SLIPPAGE_BPS, LIGHTER_SLIPPAGE_BPS are hot-reloaded from live_config.json.
+# Premium thresholds, RFQ size, trade cap, slippage budgets, and net-position
+# reconciliation are hot-reloaded from live_config.json.

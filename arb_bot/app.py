@@ -1,17 +1,18 @@
-"""Process wiring + decision loop for the basis-MR bot.
+"""Process wiring + decision loop for the executable-premium arb bot.
 
 One class, two modes:
 - live (record_only=False): trades ASSETS[0]; brings up the full stack
   (Variational receiver + command, Lighter book + executor + fill feed,
-  Recorder for PnL, Trader for execution). Calls trader.run_round() when
+  Recorder for legacy settlement files, Trader for execution). Calls
+  trader.run_arb() when
   the strategy reports an entry.
 - record-only (record_only=True): round-robins ASSETS; brings up only
   the read path (Variational receiver + command, Lighter book) and the
-  strategy (which writes ticks_<COIN>.csv per coin). NO Trader, NO
+  strategy (which writes premium_ticks_<COIN>.csv per coin). NO Trader, NO
   Executor, NO Recorder is constructed — running this cannot place an
-  order regardless of |z|.
+  order regardless of the premium.
 
-Both modes share the SAME per-tick path through BasisStrategy.tick(),
+Both modes share the SAME per-tick path through PremiumStrategy.tick(),
 so the CSV a record run produces is byte-identical to the one a live
 run produces on the same tape.
 """
@@ -27,11 +28,10 @@ import time
 
 from exchanges.variational.command_client import CommandClient
 
-from arb_bot.basis import BasisStrategy
+from arb_bot.basis import PremiumStrategy
 from arb_bot.config import (
     APP_LOG_FILE,
     ASSETS,
-    BASIS_HL_SECONDS,
     DOCS_DIR,
     FORWARDER_COMMAND_PORT,
     FORWARDER_HOST,
@@ -115,8 +115,10 @@ class App:
             self.command_client, self.live_config, RFQ_MIN_INTERVAL_MS, self.log,
         )
 
-        # Strategy — both modes (it owns per-coin EWMA + tick CSV).
-        self.strategy = BasisStrategy(self.assets, self.live_config)
+        # Strategy — executable premium entry; there is no z-score warmup or
+        # hold-then-close round. Trader handles independent slices and net
+        # exposure reconciliation.
+        self.strategy = PremiumStrategy(self.assets, self.live_config)
 
         # Execution stack — live only; None in record mode so there is no
         # order-placement path at all.
@@ -205,17 +207,17 @@ class App:
         await self.variational.wait_for_variational_ready()
         await self._activate()
         if not self.record_only:
-            import math as _math
             lc = self.live_config
             self.log.info(
-                "Armed: Z_ENTRY=%.1f Z_EXIT=%.1f Z_STOP=%s "
-                "HL=%.0fs MAX_HOLD=%.0fs notional=$%.0f cap=%s "
+                "Armed: premium long>=%.2fbps short>=%.2fbps persist=%.1fs "
+                "cooldown=%.1fs notional=$%.0f cap=%s net_tol=%s reconcile=%.0fs "
                 "(live_config.json hot-reload every tick)",
-                lc.z_entry, lc.z_exit,
-                "inf" if _math.isinf(lc.z_stop) else f"{lc.z_stop:.1f}",
-                BASIS_HL_SECONDS, lc.max_hold_seconds,
+                lc.midline_bps + lc.lower_bps,
+                lc.midline_bps + lc.upper_bps,
+                lc.premium_persist_seconds, lc.cooldown_seconds,
                 lc.rfq_notional_usdc,
                 "off" if lc.max_trades_per_run is None else str(lc.max_trades_per_run),
+                lc.net_tolerance_base, lc.reconcile_seconds,
             )
 
         rows = {a: 0 for a in self.assets}
@@ -233,6 +235,7 @@ class App:
         MAX_RECOVER_ATTEMPTS = 3
         last_fresh_at = time.monotonic()
         recover_attempts = 0
+        last_reconcile_at = 0.0
         while not self.stop_flag and not self._halted():
             # Hot-reload runtime knobs (only re-reads file on mtime change);
             # new values take effect next tick, no restart.
@@ -286,13 +289,10 @@ class App:
                 ):
                     continue
 
-                # Freeze the decision data here (after both feeds read, before
-                # z-calc). t_decision (monotonic) drives lt_book_age_local and
-                # decision_to_submit; wall_decision (epoch) drives the server-ts
-                # ages and doubles as the tick timestamp.
+                # Freeze the decision data here after both feeds read.
                 t_decision = time.monotonic()
                 wall_decision = time.time()
-                z, warm = self.strategy.tick(
+                _long_bps, _short_bps, sig = self.strategy.tick(
                     wall_decision, coin, var_quote, lighter_bid, lighter_ask,
                 )
                 rows[coin] += 1
@@ -300,12 +300,8 @@ class App:
                 if self.record_only:
                     continue
 
-                sig = self.strategy.entry(z, warm)
                 if sig is not None:
                     t_signal = time.monotonic()
-                    entry_s, entry_mu, entry_sigma = (
-                        self.strategy.signal_snapshot(coin)
-                    )
                     cap = self.live_config.max_trades_per_run
                     if cap is not None and self.opened_rounds >= cap:
                         self.log.info(
@@ -313,21 +309,33 @@ class App:
                         )
                         self.stop_flag = True
                         break
-                    direction, entry_z = sig
-                    traded = await self.trader.run_round(
-                        coin, sym, var_quote, direction, entry_z,
+                    direction, edge_bps = sig
+                    traded = await self.trader.run_arb(
+                        coin, sym, var_quote, direction, edge_bps,
                         lighter_bid, lighter_ask,
                         lt_book_at=lt_book_at,
                         lt_server_at=lt_server_at,
                         t_signal=t_signal,
                         t_decision=t_decision,
                         wall_decision=wall_decision,
-                        entry_s_bps=entry_s,
-                        entry_mu_bps=entry_mu,
-                        entry_sigma_bps=entry_sigma,
                     )
                     if traded:
                         self.opened_rounds += 1
+                    # run_arb performs an immediate reconciliation; start the
+                    # periodic interval from that read so this tick cannot
+                    # issue a duplicate hedge request.
+                    last_reconcile_at = time.monotonic()
+
+            # Reconcile even when the RFQ or book is temporarily unavailable.
+            # This catches partial fills and stale WS position updates after a
+            # restart instead of tying the safety path to a fresh quote.
+            if not self.record_only and self.trader is not None:
+                now = time.monotonic()
+                if now - last_reconcile_at >= self.live_config.reconcile_seconds:
+                    await self.trader.reconcile_and_hedge(
+                        self.assets[0], self.lighter_symbols[self.assets[0]]
+                    )
+                    last_reconcile_at = now
 
             if time.monotonic() - last_status >= 30.0:
                 self._log_status(rows)
@@ -355,14 +363,14 @@ class App:
             )
             return
         coin = self.assets[0]
-        st = self.strategy.states[coin]
+        st = self.strategy.status(coin)
         refresh = self.quotes.refresh_ms
         refresh_str = f"{refresh:.0f}ms" if refresh else "?"
-        mu_str = f"{st.mu:+.2f}" if st.mu is not None else "?"
-        sd_str = f"{st.sigma:.2f}" if st.sigma is not None else "?"
         self.log.info(
-            "%s seen=%d mu=%s sd=%s rfq_refresh~%s rows=%d",
-            coin, st.seen, mu_str, sd_str, refresh_str, rows[coin],
+            "%s long=%+.2fbps short=%+.2fbps selected=%s edge=%+.2fbps "
+            "rfq_refresh~%s rows=%d",
+            coin, st.long_bps, st.short_bps, st.selected_direction,
+            st.selected_bps, refresh_str, rows[coin],
         )
 
     async def close(self) -> None:
@@ -394,9 +402,9 @@ async def _amain(record_only: bool) -> int:
 
 def main() -> None:
     """Entrypoint. Default: live, trades ASSETS[0]. With --record:
-    round-robins ASSETS, writes ticks_<COIN>.csv per coin, places NO orders."""
+    round-robins ASSETS, writes premium_ticks_<COIN>.csv per coin, places NO orders."""
     parser = argparse.ArgumentParser(
-        description="Variational↔Lighter basis-MR bot"
+        description="Variational↔Lighter RH executable-premium arb bot"
     )
     parser.add_argument(
         "--record", action="store_true",

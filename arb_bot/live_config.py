@@ -10,9 +10,8 @@ changing them needs a kill+restart (which means ~250s warmup again).
 Anything we want to tweak mid-session lives here.
 
 What lives here vs config.py:
-- live_config.json : the *decision* knobs — Z_*, MAX_HOLD, notional, cap,
-  slippage budgets. Tweaking these doesn't touch EWMA state, so we can
-  do it without restarting the bot.
+- live_config.json : executable-premium thresholds, RFQ size, trade cap,
+  slippage budgets, and net-position reconciliation.
 - config.py        : *structural* constants — endpoints, paths, the EWMA
   HL/warmup/floor (changing these mid-flight breaks the state machine),
   RFQ pacing (changes the signal time scale).
@@ -22,7 +21,6 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -30,24 +28,20 @@ from typing import Any
 
 LIVE_CONFIG_FILE = Path("./live_config.json")
 
-# Defaults, also written to live_config.json on first start if absent (fresh
-# checkout boots without setup). Z_STOP=null in JSON means "no stop" (math.inf).
+# Defaults, also written to live_config.json on first start if absent.
 DEFAULTS: dict[str, Any] = {
-    "z_entry": 7.0,
-    "z_exit": 0.0,
-    "z_stop": None,
-    "min_hold_seconds": 0.0,
-    "max_hold_seconds": 120.0,
+    "midline_bps": 0.0,
+    "upper_bps": 4.0,
+    "lower_bps": 4.0,
+    "premium_persist_seconds": 0.0,
+    "cooldown_seconds": 1.0,
     "rfq_notional_usdc": 12.0,
     "max_trades_per_run": 5,
     "max_slippage_bps": 10.0,
     "lighter_slippage_bps": 30.0,
+    "net_tolerance_base": 0.001,
+    "reconcile_seconds": 15.0,
 }
-
-
-def _parse_z_stop(raw: Any) -> float:
-    """JSON `null` -> +inf (no stop), else float()."""
-    return math.inf if raw is None else float(raw)
 
 
 def _parse_opt_int(raw: Any) -> int | None:
@@ -59,15 +53,25 @@ class LiveConfig:
     """Mutable runtime config. Fields are overwritten in place on reload
     so anything holding a reference picks up new values on next read."""
 
-    z_entry: float = DEFAULTS["z_entry"]
-    z_exit: float = DEFAULTS["z_exit"]
-    z_stop: float = math.inf
-    min_hold_seconds: float = DEFAULTS["min_hold_seconds"]
-    max_hold_seconds: float = DEFAULTS["max_hold_seconds"]
+    midline_bps: float = DEFAULTS["midline_bps"]
+    upper_bps: float = DEFAULTS["upper_bps"]
+    lower_bps: float = DEFAULTS["lower_bps"]
+    premium_persist_seconds: float = DEFAULTS["premium_persist_seconds"]
+    cooldown_seconds: float = DEFAULTS["cooldown_seconds"]
     rfq_notional_usdc: float = DEFAULTS["rfq_notional_usdc"]
     max_trades_per_run: int | None = DEFAULTS["max_trades_per_run"]
     max_slippage_bps: float = DEFAULTS["max_slippage_bps"]
     lighter_slippage_bps: float = DEFAULTS["lighter_slippage_bps"]
+    net_tolerance_base: float = DEFAULTS["net_tolerance_base"]
+    reconcile_seconds: float = DEFAULTS["reconcile_seconds"]
+
+    # Kept only so the deprecated BasisStrategy/run_round compatibility path
+    # remains importable for old tooling. The live app never reads these.
+    z_entry: float = 7.0
+    z_exit: float = 0.0
+    z_stop: float = float("inf")
+    min_hold_seconds: float = 0.0
+    max_hold_seconds: float = 120.0
 
     _path: Path = field(default=LIVE_CONFIG_FILE, repr=False)
     _last_mtime: float = field(default=0.0, repr=False)
@@ -110,17 +114,19 @@ class LiveConfig:
                 )
             return False
         try:
-            z_entry = float(data["z_entry"])
-            z_exit = float(data["z_exit"])
-            z_stop = _parse_z_stop(data["z_stop"])
-            # Optional/newer key: tolerate old configs that lack it (fall back
-            # to default) instead of rejecting the whole reload.
-            min_hold = float(data.get("min_hold_seconds", DEFAULTS["min_hold_seconds"]))
-            max_hold = float(data["max_hold_seconds"])
+            midline = float(data.get("midline_bps", DEFAULTS["midline_bps"]))
+            upper = float(data.get("upper_bps", DEFAULTS["upper_bps"]))
+            lower = float(data.get("lower_bps", DEFAULTS["lower_bps"]))
+            persist = float(data.get("premium_persist_seconds", DEFAULTS["premium_persist_seconds"]))
+            cooldown = float(data.get("cooldown_seconds", DEFAULTS["cooldown_seconds"]))
             notional = float(data["rfq_notional_usdc"])
-            cap = _parse_opt_int(data["max_trades_per_run"])
+            cap = _parse_opt_int(data.get("max_trades_per_run"))
             max_slip = float(data["max_slippage_bps"])
             lt_slip = float(data["lighter_slippage_bps"])
+            tolerance = float(data.get("net_tolerance_base", DEFAULTS["net_tolerance_base"]))
+            reconcile = float(data.get("reconcile_seconds", DEFAULTS["reconcile_seconds"]))
+            if upper < 0 or lower < 0 or notional <= 0 or tolerance < 0 or reconcile <= 0:
+                raise ValueError("thresholds, notional, tolerance, and reconcile_seconds must be positive")
         except (KeyError, TypeError, ValueError) as exc:
             if self._logger is not None:
                 self._logger.error(
@@ -129,24 +135,28 @@ class LiveConfig:
                 )
             return False
         # All parsed OK — commit atomically.
-        self.z_entry = z_entry
-        self.z_exit = z_exit
-        self.z_stop = z_stop
-        self.min_hold_seconds = min_hold
-        self.max_hold_seconds = max_hold
+        self.midline_bps = midline
+        self.upper_bps = upper
+        self.lower_bps = lower
+        self.premium_persist_seconds = max(0.0, persist)
+        self.cooldown_seconds = max(0.0, cooldown)
         self.rfq_notional_usdc = notional
         self.max_trades_per_run = cap
         self.max_slippage_bps = max_slip
         self.lighter_slippage_bps = lt_slip
+        self.net_tolerance_base = tolerance
+        self.reconcile_seconds = reconcile
         self._last_mtime = st.st_mtime
         if self._logger is not None:
             self._logger.info(
-                "live_config reloaded: z_entry=%.1f z_exit=%.1f z_stop=%s "
-                "min_hold=%.0fs max_hold=%.0fs notional=$%.0f cap=%s max_slip=%.1f lt_slip=%.1f",
-                self.z_entry, self.z_exit,
-                "inf" if math.isinf(self.z_stop) else f"{self.z_stop:.1f}",
-                self.min_hold_seconds, self.max_hold_seconds, self.rfq_notional_usdc,
+                "live_config reloaded: midline=%+.2fbps upper=%.2fbps lower=%.2fbps "
+                "persist=%.1fs cooldown=%.1fs notional=$%.0f cap=%s "
+                "max_slip=%.1f lt_slip=%.1f net_tol=%s reconcile=%.0fs",
+                self.midline_bps, self.upper_bps, self.lower_bps,
+                self.premium_persist_seconds, self.cooldown_seconds,
+                self.rfq_notional_usdc,
                 "off" if self.max_trades_per_run is None else self.max_trades_per_run,
                 self.max_slippage_bps, self.lighter_slippage_bps,
+                self.net_tolerance_base, self.reconcile_seconds,
             )
         return True

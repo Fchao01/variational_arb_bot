@@ -1,11 +1,13 @@
 {
-  "z_entry": 7.0,
-  "z_exit": 0.0,
-  "z_stop": null,
-  "min_hold_seconds": 5.0,
-  "max_hold_seconds": 120.0,
+  "midline_bps": 0.0,
+  "upper_bps": 4.0,
+  "lower_bps": 4.0,
+  "premium_persist_seconds": 0.0,
+  "cooldown_seconds": 1.0,
   "rfq_notional_usdc": 12.0,
   "max_trades_per_run": 5,
   "max_slippage_bps": 10.0,
-  "lighter_slippage_bps": 30.0
+  "lighter_slippage_bps": 30.0,
+  "net_tolerance_base": 0.001,
+  "reconcile_seconds": 15.0
 }

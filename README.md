@@ -1,39 +1,42 @@
 # variational_arb_bot
 
 ### 概述
-基于 Chrome 插件转发的 Variational <-> Lighter 跨所 **basis 均值回归**机器人。
+基于 Chrome 插件转发的 Variational <-> Lighter RH 跨所**可执行价差套利**机器人。
 
 行情侧没有 API：登录态浏览器停在 Variational 交易页时持续拉 indicative RFQ，CDP 插件把每条报价
 转发给本进程；本进程再按配置的 USDC notional **主动**拉一条新鲜 RFQ（复用其 quote_id）。
 
-信号是 basis 偏离对自身 EWMA 的 z-score：
+信号直接使用两边的**可成交价**，不再使用 z-score：
 
-- `s = (var_mid − lighter_mid) / lighter_mid × 1e4`（bps）
-- 对 `s` 维护严格因果、时间感知的在线 EWMA 均值 μ 和方差，`z = (s − μ) / σ`
-- `|z| ≥ z_entry` 且已 warm 时**同时**打两条腿：
-  - `z > 0`（Var 偏贵）→ `short_var`：Variational 卖出（复用 quote_id）+ Lighter 买入
-  - `z < 0`（Var 偏便宜）→ `long_var`：Variational 买入（复用 quote_id）+ Lighter 卖出
-- 平仓（任一触发）：z 回归到 `z_exit`（reverted）/ z 反向冲破 `z_stop`（adverse_stop）/
-  持仓超 `max_hold_seconds`
+- `long_var`：买 Variational ask、卖 Lighter bid，价差达到 `lower_bps`
+- `short_var`：卖 Variational bid、买 Lighter ask，价差达到 `upper_bps`
+- 价差可设置持续时间 `premium_persist_seconds`，同一段价差只触发一次，回落后重新武装
+- 两腿按实际成交结果更新仓位；若两边成交数量不一致，读取两边签名仓位并发送 reduce-only 净敞口对冲
+
+这套逻辑不是原来的“开仓后等待信号平仓”。每个价差机会是一个独立切片，
+对冲后两边仍可能各自保留相反方向的仓位；停止程序不会自动把这些配对仓位全部平掉。
+异常退出后应先用 `tools/flatten_positions.py` 核对并按需执行应急平仓。
 
 复用浏览器 quote_id ⇒ 决策价即成交价，省掉一整个重新询价来回。
 币种由 `arb_bot/config.py` 的 `ASSETS` 决定：**实盘只交易 `ASSETS[0]`**（启动锁定），录制模式轮询全部。
 
 ### 两套参数
-- **`live_config.json`（热加载：每个 tick 重读，改完存盘下一 tick 即生效，不用重启/重新预热）**：
-  `z_entry` / `z_exit` / `z_stop`（null = 无止损）/ `max_hold_seconds` / `rfq_notional_usdc` /
-  `max_trades_per_run` / `max_slippage_bps`（Variational）/ `lighter_slippage_bps`（Lighter 兜底滑点）
+- **`live_config.json`（热加载：每个 tick 重读）**：
+  `midline_bps` / `upper_bps` / `lower_bps` / `premium_persist_seconds` /
+  `cooldown_seconds` / `rfq_notional_usdc` / `max_trades_per_run` /
+  `max_slippage_bps` / `lighter_slippage_bps` / `net_tolerance_base` /
+  `reconcile_seconds`
 - **`arb_bot/config.py`（结构性，改了要重启）**：`ASSETS`，EWMA 的 `BASIS_HL_SECONDS` /
   `BASIS_WARMUP_SAMPLES` / `BASIS_GAP_RESET_S` / `BASIS_SIGMA_FLOOR_BPS`，RFQ 节奏 `RFQ_MIN_INTERVAL_MS`。
   RFQ 节奏是结构性的：它决定信号的时间尺度（z 分布），所以不放进热加载。
 
 ### 项目结构
 - `main.py`：唯一入口。`python main.py` 实盘交易 `ASSETS[0]`；
-  `python main.py --record` 只录制（轮询 `ASSETS`，**绝不下单**，每币写 `docs/ticks_<COIN>.csv`）
+  `python main.py --record` 只录制（轮询 `ASSETS`，**绝不下单**，每币写 `docs/premium_ticks_<COIN>.csv`）
 - `arb_bot/app.py`：进程接线 + 两种模式 + 主决策循环
-- `arb_bot/basis.py`：basis z-score 信号 + 开/平仓决策（无网络 IO）
+- `arb_bot/basis.py`：可执行价差触发器（无网络 IO）
 - `arb_bot/quotes.py`：主动拉 RFQ + 新鲜度 + 跨所边际（信号侧）
-- `arb_bot/trader.py`：一轮的双腿开仓/持有/平仓 + 真实成交结算（执行侧）
+- `arb_bot/trader.py`：双腿执行、单腿回滚、仓位读取和净敞口 reduce-only 对冲
 - `arb_bot/recorder.py`：脱离热路径的结算与 PnL/诊断落盘
 - `arb_bot/live_config.py`：`live_config.json` 热加载
 - `arb_bot/`：feed（Variational 适配）、tick_logger、helpers
@@ -112,7 +115,7 @@ python main.py --record   # 只录制，轮询 ASSETS，绝不下单
 - `./log/runtime.log`：唯一运行日志（同时回显到终端）
 - `./docs/pnl.csv`：每轮真实成交价结算的 PnL（money ledger）
 - `./docs/rounds_diag.csv`：每轮完整诊断（信号状态 / 各腿锚点价 / 延迟 / 漂移）
-- `./docs/ticks_<COIN>.csv`：每币逐 tick 信号序列（实盘与录制走同一 tick 路径）
+- `./docs/premium_ticks_<COIN>.csv`：每币逐 tick 的 RFQ、盘口和可执行价差
 
 终端不落盘原始 REST/WS 消息。
 

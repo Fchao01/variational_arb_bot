@@ -165,6 +165,30 @@ class Executor:
     def config(self, symbol: str) -> MarketConfig | None:
         return self._cfg.get(symbol.upper())
 
+    def _fetch_position_sync(self, symbol: str) -> Decimal:
+        """Read the signed base position from the RH account endpoint."""
+        account_index = required_int_env("LIGHTER_ACCOUNT_INDEX")
+        resp = requests.get(
+            f"{self._base_url}/api/v1/account",
+            params={"by": "index", "value": str(account_index)},
+            headers={"accept": "application/json"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        want = symbol.upper()
+        for account in resp.json().get("accounts", []) or []:
+            for position in account.get("positions", []) or []:
+                if str(position.get("symbol", "")).upper() != want:
+                    continue
+                qty = to_decimal(position.get("position")) or Decimal("0")
+                sign = to_decimal(position.get("sign")) or Decimal("1")
+                return qty * sign
+        return Decimal("0")
+
+    async def fetch_position(self, symbol: str) -> Decimal:
+        """Read the signed Lighter position without blocking the event loop."""
+        return await asyncio.to_thread(self._fetch_position_sync, symbol)
+
     def hedge_blocked(
         self, symbol: str, qty: Decimal, ref_price: Decimal
     ) -> str | None:

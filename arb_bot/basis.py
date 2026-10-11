@@ -28,6 +28,7 @@ The Z_* thresholds live ONLY here — trader.py never imports them.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 
@@ -236,3 +237,145 @@ class BasisStrategy:
             if z <= -z_stop:
                 return "adverse_stop"
         return None
+
+
+@dataclass
+class PremiumState:
+    """Per-asset state for an executable-premium trigger.
+
+    The trigger is edge-triggered: after firing, it will not fire repeatedly
+    while the same premium remains above the threshold. It rearms only after
+    the premium falls back below its threshold (or the direction changes).
+    """
+
+    pending_direction: str | None = None
+    pending_since: float | None = None
+    cooldown_until: float = 0.0
+    armed: bool = True
+    long_bps: float = 0.0
+    short_bps: float = 0.0
+    selected_bps: float = 0.0
+    selected_direction: str | None = None
+
+
+class PremiumStrategy:
+    """Executable cross-venue premium strategy.
+
+    This replaces the old z-score entry/exit decision. A quote is eligible
+    when the price that can actually be bought on one venue is below the price
+    that can actually be sold on the other venue by the configured premium:
+
+    * ``long_var``: buy Variational at ask, sell Lighter at bid.
+    * ``short_var``: sell Variational at bid, buy Lighter at ask.
+
+    It deliberately does not create a hold/close round. Each eligible slice
+    is executed independently, and Trader reconciles the resulting net base
+    exposure with reduce-only orders.
+    """
+
+    def __init__(self, assets: list[str], live_config: LiveConfig) -> None:
+        self.states: dict[str, PremiumState] = {
+            asset: PremiumState() for asset in assets
+        }
+        self.tick_loggers: dict[str, TickLogger] = {}
+        self._live = live_config
+
+    def attach_tick_loggers(self, assets: list[str]) -> None:
+        for coin in assets:
+            self.tick_loggers[coin] = TickLogger(
+                Path(DOCS_DIR) / f"premium_ticks_{coin}.csv"
+            )
+
+    def close_tick_loggers(self) -> None:
+        for tl in self.tick_loggers.values():
+            try:
+                tl.close()
+            except Exception:
+                pass
+        self.tick_loggers.clear()
+
+    def tick(
+        self,
+        ts: float,
+        coin: str,
+        var_quote: Quote,
+        lighter_bid: Decimal,
+        lighter_ask: Decimal,
+    ) -> tuple[float, float, tuple[str, float] | None]:
+        """Return ``(long_edge_bps, short_edge_bps, signal)``.
+
+        ``signal`` is ``(direction, edge_bps)`` only after the edge has
+        persisted for the configured interval and the trigger is rearmed.
+        """
+        long_edge, short_edge = edges(var_quote, lighter_bid, lighter_ask)
+        long_bps, short_bps = float(long_edge), float(short_edge)
+        state = self.states[coin]
+        state.long_bps = long_bps
+        state.short_bps = short_bps
+
+        long_threshold = self._live.midline_bps + self._live.lower_bps
+        short_threshold = self._live.midline_bps + self._live.upper_bps
+        candidates = []
+        if long_bps >= long_threshold:
+            candidates.append(("long_var", long_bps))
+        if short_bps >= short_threshold:
+            candidates.append(("short_var", short_bps))
+
+        if not candidates:
+            state.pending_direction = None
+            state.pending_since = None
+            state.armed = True
+            state.selected_direction = None
+            state.selected_bps = max(long_bps, short_bps)
+            self._log_tick(
+                coin, var_quote, lighter_bid, lighter_ask, long_edge, short_edge
+            )
+            return long_bps, short_bps, None
+
+        direction, edge_bps = max(candidates, key=lambda item: item[1])
+        state.selected_direction = direction
+        state.selected_bps = edge_bps
+        if state.pending_direction != direction:
+            state.pending_direction = direction
+            state.pending_since = ts
+        if state.pending_since is None:
+            state.pending_since = ts
+
+        signal: tuple[str, float] | None = None
+        persisted = ts - state.pending_since >= self._live.premium_persist_seconds
+        if (
+            persisted
+            and state.armed
+            and ts >= state.cooldown_until
+        ):
+            signal = (direction, edge_bps)
+            state.armed = False
+            state.cooldown_until = ts + self._live.cooldown_seconds
+
+        self._log_tick(
+            coin, var_quote, lighter_bid, lighter_ask, long_edge, short_edge
+        )
+        return long_bps, short_bps, signal
+
+    def status(self, coin: str) -> PremiumState:
+        return self.states[coin]
+
+    def _log_tick(
+        self,
+        coin: str,
+        quote: Quote,
+        lighter_bid: Decimal,
+        lighter_ask: Decimal,
+        long_bps: Decimal,
+        short_bps: Decimal,
+    ) -> None:
+        tl = self.tick_loggers.get(coin)
+        if tl is not None:
+            # Existing TickLogger already stores both executable edges. The
+            # z-score columns are left empty for compatibility with old tools;
+            # the new strategy's canonical tape is premium_ticks_<COIN>.csv.
+            tl.log(
+                quote.bid, quote.ask, quote.quote_id, quote.qty,
+                lighter_bid, lighter_ask, long_bps, short_bps,
+                s_bps=None, mu_bps=None, sigma_bps=None, z=None,
+            )

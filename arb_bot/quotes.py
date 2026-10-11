@@ -6,8 +6,7 @@ as fast as the website re-quotes — a ~0.5s staleness window), QuoteReader
 actively pulls a fresh Variational RFQ on demand via the command channel,
 sized to a configured USDC notional and aligned to the per-coin qty tick
 the indicative reports. `edges()` prices it against the Lighter book —
-used by the tick logger for offline analysis; the live strategy decides
-direction off the basis-MR z-score in trader.py, not these edges.
+used by both the live executable-premium trigger and the tick logger.
 """
 
 from __future__ import annotations
@@ -122,6 +121,19 @@ class QuoteReader:
     def refresh_ms(self) -> float | None:
         """Observed interval between successive successful RFQ pulls."""
         return self._refresh_ms
+
+    def align_qty(self, coin: str, qty: Decimal) -> Decimal:
+        """Floor a reduce-only Variational quantity to its learned RFQ tick.
+
+        A fresh reduce-only order is allowed to request a new quote, but it
+        still must respect the quantity granularity learned from indicative
+        responses. Before the first RFQ, use the conservative six-decimal
+        default.
+        """
+        tick = self._tick.get(coin.upper(), _DEFAULT_TICK)
+        if tick <= 0:
+            return qty
+        return (qty / tick).to_integral_value(rounding=ROUND_DOWN) * tick
 
     async def read(self, coin: str) -> Quote | None:
         """A fresh, firable RFQ for `coin`, or None — never a cached or
