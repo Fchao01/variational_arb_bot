@@ -36,11 +36,16 @@ DEFAULTS: dict[str, Any] = {
     "premium_persist_seconds": 0.0,
     "cooldown_seconds": 1.0,
     "rfq_notional_usdc": 12.0,
+    "max_order_notional_usdc": 500.0,
+    "min_order_notional_usdc": 10.0,
     "max_trades_per_run": 5,
     "max_slippage_bps": 10.0,
     "lighter_slippage_bps": 30.0,
     "net_tolerance_base": 0.001,
     "reconcile_seconds": 15.0,
+    "max_consecutive_errors": 3,
+    "rate_limit_pause_seconds": 10.0,
+    "staleness_seconds": 45.0,
 }
 
 
@@ -59,11 +64,16 @@ class LiveConfig:
     premium_persist_seconds: float = DEFAULTS["premium_persist_seconds"]
     cooldown_seconds: float = DEFAULTS["cooldown_seconds"]
     rfq_notional_usdc: float = DEFAULTS["rfq_notional_usdc"]
+    max_order_notional_usdc: float = DEFAULTS["max_order_notional_usdc"]
+    min_order_notional_usdc: float = DEFAULTS["min_order_notional_usdc"]
     max_trades_per_run: int | None = DEFAULTS["max_trades_per_run"]
     max_slippage_bps: float = DEFAULTS["max_slippage_bps"]
     lighter_slippage_bps: float = DEFAULTS["lighter_slippage_bps"]
     net_tolerance_base: float = DEFAULTS["net_tolerance_base"]
     reconcile_seconds: float = DEFAULTS["reconcile_seconds"]
+    max_consecutive_errors: int = DEFAULTS["max_consecutive_errors"]
+    rate_limit_pause_seconds: float = DEFAULTS["rate_limit_pause_seconds"]
+    staleness_seconds: float = DEFAULTS["staleness_seconds"]
 
     # Kept only so the deprecated BasisStrategy/run_round compatibility path
     # remains importable for old tooling. The live app never reads these.
@@ -120,13 +130,23 @@ class LiveConfig:
             persist = float(data.get("premium_persist_seconds", DEFAULTS["premium_persist_seconds"]))
             cooldown = float(data.get("cooldown_seconds", DEFAULTS["cooldown_seconds"]))
             notional = float(data["rfq_notional_usdc"])
+            max_order_notional = float(data.get("max_order_notional_usdc", DEFAULTS["max_order_notional_usdc"]))
+            min_order_notional = float(data.get("min_order_notional_usdc", DEFAULTS["min_order_notional_usdc"]))
             cap = _parse_opt_int(data.get("max_trades_per_run"))
             max_slip = float(data["max_slippage_bps"])
             lt_slip = float(data["lighter_slippage_bps"])
             tolerance = float(data.get("net_tolerance_base", DEFAULTS["net_tolerance_base"]))
             reconcile = float(data.get("reconcile_seconds", DEFAULTS["reconcile_seconds"]))
-            if upper < 0 or lower < 0 or notional <= 0 or tolerance < 0 or reconcile <= 0:
-                raise ValueError("thresholds, notional, tolerance, and reconcile_seconds must be positive")
+            max_errors = int(data.get("max_consecutive_errors", DEFAULTS["max_consecutive_errors"]))
+            rate_pause = float(data.get("rate_limit_pause_seconds", DEFAULTS["rate_limit_pause_seconds"]))
+            stale = float(data.get("staleness_seconds", DEFAULTS["staleness_seconds"]))
+            if (
+                upper < 0 or lower < 0 or notional <= 0
+                or min_order_notional <= 0 or max_order_notional < min_order_notional
+                or tolerance < 0 or reconcile <= 0 or max_errors <= 0
+                or rate_pause <= 0 or stale <= 0
+            ):
+                raise ValueError("invalid premium, sizing, circuit-breaker, or feed-safety values")
         except (KeyError, TypeError, ValueError) as exc:
             if self._logger is not None:
                 self._logger.error(
@@ -141,22 +161,31 @@ class LiveConfig:
         self.premium_persist_seconds = max(0.0, persist)
         self.cooldown_seconds = max(0.0, cooldown)
         self.rfq_notional_usdc = notional
+        self.max_order_notional_usdc = max_order_notional
+        self.min_order_notional_usdc = min_order_notional
         self.max_trades_per_run = cap
         self.max_slippage_bps = max_slip
         self.lighter_slippage_bps = lt_slip
         self.net_tolerance_base = tolerance
         self.reconcile_seconds = reconcile
+        self.max_consecutive_errors = max_errors
+        self.rate_limit_pause_seconds = rate_pause
+        self.staleness_seconds = stale
         self._last_mtime = st.st_mtime
         if self._logger is not None:
             self._logger.info(
                 "live_config reloaded: midline=%+.2fbps upper=%.2fbps lower=%.2fbps "
-                "persist=%.1fs cooldown=%.1fs notional=$%.0f cap=%s "
-                "max_slip=%.1f lt_slip=%.1f net_tol=%s reconcile=%.0fs",
+                "persist=%.1fs cooldown=%.1fs notional=$%.0f range=$%.0f..$%.0f cap=%s "
+                "max_slip=%.1f lt_slip=%.1f net_tol=%s reconcile=%.0fs "
+                "errors=%d rate_pause=%.1fs stale=%.0fs",
                 self.midline_bps, self.upper_bps, self.lower_bps,
                 self.premium_persist_seconds, self.cooldown_seconds,
                 self.rfq_notional_usdc,
+                self.min_order_notional_usdc, self.max_order_notional_usdc,
                 "off" if self.max_trades_per_run is None else self.max_trades_per_run,
                 self.max_slippage_bps, self.lighter_slippage_bps,
                 self.net_tolerance_base, self.reconcile_seconds,
+                self.max_consecutive_errors, self.rate_limit_pause_seconds,
+                self.staleness_seconds,
             )
         return True

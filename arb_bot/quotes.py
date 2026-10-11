@@ -175,7 +175,17 @@ class QuoteReader:
         if bid is None or ask is None or bid <= 0 or ask <= 0:
             return None
         mid = (bid + ask) / Decimal("2")
-        raw_qty = Decimal(str(self._live.rfq_notional_usdc)) / mid
+        requested_notional = Decimal(str(self._live.rfq_notional_usdc))
+        min_notional = Decimal(str(self._live.min_order_notional_usdc))
+        max_notional = Decimal(str(self._live.max_order_notional_usdc))
+        if requested_notional < min_notional:
+            self._log.warning(
+                "RFQ %s skipped: rfq_notional=$%s below min_order_notional=$%s",
+                coin, requested_notional, min_notional,
+            )
+            return None
+        requested_notional = min(requested_notional, max_notional)
+        raw_qty = requested_notional / mid
 
         cached_tick = self._tick.get(coin.upper())
         had_tick = cached_tick is not None
@@ -198,6 +208,12 @@ class QuoteReader:
             qty = lighter_qty
         if qty <= 0:
             return None
+        if qty * mid < min_notional:
+            self._log.info(
+                "RFQ %s skipped after quantity rounding: notional=$%s < min=$%s",
+                coin, qty * mid, min_notional,
+            )
+            return None
 
         # Anchor next read()'s spacing on the attempt (not success) so errors
         # can't busy-loop.
@@ -217,7 +233,12 @@ class QuoteReader:
         # Rate limited: arm the backoff read() honours, skip this tick.
         if result.get("httpStatus") == 429:
             reset_ms = to_decimal(result.get("rateLimitResetMs")) or Decimal("0")
-            backoff = max(float(reset_ms) / 1000.0, self._min_interval)
+            configured_pause = float(self._live.rate_limit_pause_seconds)
+            backoff = max(
+                float(reset_ms) / 1000.0,
+                configured_pause,
+                self._min_interval,
+            )
             self._backoff_until = time.monotonic() + backoff
             self._log.warning(
                 "RFQ %s rate limited (429), backing off %.1fs", coin, backoff

@@ -82,7 +82,8 @@ class App:
             )
             self.log.addHandler(handler)
 
-        # Hot-reloadable runtime knobs (Z_*, MAX_HOLD, notional, cap, slippage),
+        # Hot-reloadable runtime knobs (premium thresholds, sizing, slippage,
+        # circuit breaker, and feed safety),
         # re-read fresh each tick via maybe_reload() in the main loop.
         self.live_config = LiveConfig()
         self.live_config.attach_logger(self.log)
@@ -210,14 +211,18 @@ class App:
             lc = self.live_config
             self.log.info(
                 "Armed: premium long>=%.2fbps short>=%.2fbps persist=%.1fs "
-                "cooldown=%.1fs notional=$%.0f cap=%s net_tol=%s reconcile=%.0fs "
+                "cooldown=%.1fs notional=$%.0f range=$%.0f..$%.0f cap=%s "
+                "net_tol=%s reconcile=%.0fs errors=%d rate_pause=%.1fs stale=%.0fs "
                 "(live_config.json hot-reload every tick)",
                 lc.lower_bps - lc.midline_bps,
                 lc.midline_bps + lc.upper_bps,
                 lc.premium_persist_seconds, lc.cooldown_seconds,
                 lc.rfq_notional_usdc,
+                lc.min_order_notional_usdc, lc.max_order_notional_usdc,
                 "off" if lc.max_trades_per_run is None else str(lc.max_trades_per_run),
                 lc.net_tolerance_base, lc.reconcile_seconds,
+                lc.max_consecutive_errors, lc.rate_limit_pause_seconds,
+                lc.staleness_seconds,
             )
 
         rows = {a: 0 for a in self.assets}
@@ -230,8 +235,10 @@ class App:
         # fail to bring quotes back do we exit with EXIT_STALE_UNRECOVERABLE so a
         # supervisor can restart. (This watchdog only runs between rounds; a freeze
         # *during* an open round is healed by the extension's own frame watchdog.)
-        STALE_THRESHOLD_S = 45.0
-        RECOVER_GRACE_S = 25.0       # post-reload window for the page to re-quote
+        # Keep the recovery grace below the configured stale threshold so a
+        # short stale setting cannot immediately trigger a second reload.
+        stale_threshold_s = self.live_config.staleness_seconds
+        recover_grace_s = min(25.0, max(1.0, stale_threshold_s * 0.55))
         MAX_RECOVER_ATTEMPTS = 3
         last_fresh_at = time.monotonic()
         recover_attempts = 0
@@ -240,11 +247,13 @@ class App:
             # Hot-reload runtime knobs (only re-reads file on mtime change);
             # new values take effect next tick, no restart.
             self.live_config.maybe_reload()
+            stale_threshold_s = self.live_config.staleness_seconds
+            recover_grace_s = min(25.0, max(1.0, stale_threshold_s * 0.55))
 
             # Stale-data watchdog: reload-to-resync, escalate to exit only if it
             # keeps failing.
             stale_for = time.monotonic() - last_fresh_at
-            if stale_for > STALE_THRESHOLD_S:
+            if stale_for > stale_threshold_s:
                 if recover_attempts >= MAX_RECOVER_ATTEMPTS:
                     self.log.error(
                         "STALE: no fresh quote for %.0fs after %d page reloads — "
@@ -267,7 +276,7 @@ class App:
                 # next stale check fires (backdate the clock so stale_for resets to
                 # STALE_THRESHOLD_S − RECOVER_GRACE_S).
                 last_fresh_at = (
-                    time.monotonic() - (STALE_THRESHOLD_S - RECOVER_GRACE_S)
+                    time.monotonic() - (stale_threshold_s - recover_grace_s)
                 )
 
             for coin in self.assets:

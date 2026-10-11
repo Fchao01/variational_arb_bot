@@ -60,6 +60,25 @@ class Trader:
 
         self.halted = False
         self._last_hedge_block_log = 0.0
+        self._consecutive_errors = 0
+
+    def _execution_error(self, reason: str) -> None:
+        """Count consecutive two-leg execution failures and trip the breaker."""
+        self._consecutive_errors += 1
+        limit = self._live.max_consecutive_errors
+        self._log.warning(
+            "execution error %d/%d: %s",
+            self._consecutive_errors, limit, reason,
+        )
+        if self._consecutive_errors >= limit:
+            self._log.error(
+                "max_consecutive_errors=%d reached — halting new orders",
+                limit,
+            )
+            self.halted = True
+
+    def _execution_success(self) -> None:
+        self._consecutive_errors = 0
 
     async def run_arb(
         self,
@@ -155,6 +174,7 @@ class Trader:
                 var_asset, lighter_info,
             )
             await self._rollback_var(var_asset, var_side, qty)
+            self._execution_error(f"Lighter leg failed: {lighter_info}")
             return False
         if lighter_ok and not var_ok:
             self._log.error(
@@ -164,11 +184,15 @@ class Trader:
             await self._rollback_lighter(
                 lighter_symbol, lighter_side, qty, lighter_bid, lighter_ask
             )
+            self._execution_error(f"Variational leg failed: {var_info}")
             return False
         if not var_ok and not lighter_ok:
             self._log.warning(
                 "%s: both arb legs failed (var=%s lighter=%s)",
                 var_asset, var_info, lighter_info,
+            )
+            self._execution_error(
+                f"both legs failed (var={var_info}, lighter={lighter_info})"
             )
             return False
 
@@ -187,7 +211,10 @@ class Trader:
         # the immediate reconciliation. The periodic reconciliation below is
         # still authoritative if this event arrives later.
         await asyncio.sleep(0.1)
-        await self.reconcile_and_hedge(var_asset, lighter_symbol)
+        if not await self.reconcile_and_hedge(var_asset, lighter_symbol):
+            self._execution_error("post-trade net exposure reconciliation failed")
+            return False
+        self._execution_success()
         return True
 
     async def reconcile_and_hedge(

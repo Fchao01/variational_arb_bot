@@ -24,9 +24,10 @@
 ### 两套参数
 - **`live_config.json`（热加载：每个 tick 重读）**：
   `midline_bps` / `upper_bps` / `lower_bps` / `premium_persist_seconds` /
-  `cooldown_seconds` / `rfq_notional_usdc` / `max_trades_per_run` /
-  `max_slippage_bps` / `lighter_slippage_bps` / `net_tolerance_base` /
-  `reconcile_seconds`
+  `cooldown_seconds` / `rfq_notional_usdc` / `max_order_notional_usdc` /
+  `min_order_notional_usdc` / `max_trades_per_run` / `max_slippage_bps` /
+  `lighter_slippage_bps` / `net_tolerance_base` / `reconcile_seconds` /
+  `max_consecutive_errors` / `rate_limit_pause_seconds` / `staleness_seconds`
 - **`arb_bot/config.py`（结构性，改了要重启）**：`ASSETS`，EWMA 的 `BASIS_HL_SECONDS` /
   `BASIS_WARMUP_SAMPLES` / `BASIS_GAP_RESET_S` / `BASIS_SIGMA_FLOOR_BPS`，RFQ 节奏 `RFQ_MIN_INTERVAL_MS`。
   RFQ 节奏是结构性的：它决定信号的时间尺度（z 分布），所以不放进热加载。
