@@ -313,7 +313,9 @@ class PremiumStrategy:
         state.long_bps = long_bps
         state.short_bps = short_bps
 
-        long_threshold = self._live.midline_bps + self._live.lower_bps
+        # The long edge is quoted in the reverse direction (Lighter / Var),
+        # so a positive Var premium center lowers the reverse hurdle.
+        long_threshold = self._live.lower_bps - self._live.midline_bps
         short_threshold = self._live.midline_bps + self._live.upper_bps
         candidates = []
         if long_bps >= long_threshold:

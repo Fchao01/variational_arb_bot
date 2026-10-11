@@ -8,8 +8,9 @@
 
 信号直接使用两边的**可成交价**，不再使用 z-score：
 
-- `long_var`：买 Variational ask、卖 Lighter bid，价差达到 `lower_bps`
-- `short_var`：卖 Variational bid、买 Lighter ask，价差达到 `upper_bps`
+- `long_var`：买 Variational ask、卖 Lighter bid，反向价差 `(Lighter bid / Var ask - 1) × 10000` 达到 `lower_bps - midline_bps`
+- `short_var`：卖 Variational bid、买 Lighter ask，正向价差 `(Var bid / Lighter ask - 1) × 10000` 达到 `midline_bps + upper_bps`
+- `midline_bps`：Var 相对 Lighter 的长期溢价中枢，默认 `0.0`；根据采集数据手动设定，不会自动学习
 - 价差可设置持续时间 `premium_persist_seconds`，同一段价差只触发一次，回落后重新武装
 - 两腿按实际成交结果更新仓位；若两边成交数量不一致，读取两边签名仓位并发送 reduce-only 净敞口对冲
 

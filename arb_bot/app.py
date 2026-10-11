@@ -212,7 +212,7 @@ class App:
                 "Armed: premium long>=%.2fbps short>=%.2fbps persist=%.1fs "
                 "cooldown=%.1fs notional=$%.0f cap=%s net_tol=%s reconcile=%.0fs "
                 "(live_config.json hot-reload every tick)",
-                lc.midline_bps + lc.lower_bps,
+                lc.lower_bps - lc.midline_bps,
                 lc.midline_bps + lc.upper_bps,
                 lc.premium_persist_seconds, lc.cooldown_seconds,
                 lc.rfq_notional_usdc,
