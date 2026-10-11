@@ -31,7 +31,7 @@ LIGHTER_WS_PING_TIMEOUT_SECONDS = 30
 
 # Variational underlying symbols; Lighter ticker derived via the overrides.
 # Live mode trades ASSETS[0]; record mode round-robins all.
-ASSETS = ["ETH"]
+ASSETS = ["SOL"]
 
 # Basis MR signal: trade s = (var_mid - lighter_mid)/lighter_mid * 1e4 against
 # its strictly-causal, time-aware EWMA mean/variance.
