@@ -440,8 +440,21 @@ class Trader:
             var_asset, direction, exit_reason, hold_seconds, exit_z,
             int((t_close_submit - t_exit_signal) * 1000),
         )
-        # First close uses the last hold-loop quote_id (path b); retry drops it (path c).
-        close_reuse_qid = last_good_quote.quote_id if last_good_quote else None
+        # A market quote_id is bound to the quantity used to create it. Only
+        # reuse the hold-loop quote when that bound quantity exactly matches
+        # the real filled entry; otherwise the quote can close one quantity
+        # tick short (or long) and leave a residual position. The fresh path
+        # below sends var_close_qty in its indicative request.
+        close_reuse_qid: str | None = None
+        if last_good_quote is not None:
+            if last_good_quote.qty == var_close_qty:
+                close_reuse_qid = last_good_quote.quote_id
+            else:
+                self._log.info(
+                    "%s close quote qty %s != real Var fill %s; "
+                    "requesting a fresh close quote",
+                    var_asset, last_good_quote.qty, var_close_qty,
+                )
         (var_status, var_info), (lighter_status, lighter_info) = (
             await asyncio.gather(
                 close_var(reuse_qid=close_reuse_qid), close_lighter()
