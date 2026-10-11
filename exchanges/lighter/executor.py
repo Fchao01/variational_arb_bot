@@ -103,9 +103,14 @@ class Executor:
 
     def ensure_client(self) -> SignerClient:
         if self._client is None:
-            key = os.getenv("API_KEY_PRIVATE_KEY", "").strip() or os.getenv(
-                "LIGHTER_PRIVATE_KEY", ""
-            ).strip()
+            key = os.getenv("LIGHTER_PRIVATE_KEY", "").strip()
+            legacy_key = os.getenv("API_KEY_PRIVATE_KEY", "").strip()
+            if key and legacy_key and key.removeprefix("0x") != legacy_key.removeprefix("0x"):
+                raise RuntimeError(
+                    "Conflicting LIGHTER_PRIVATE_KEY and API_KEY_PRIVATE_KEY; "
+                    "remove the legacy API_KEY_PRIVATE_KEY and use RH credentials."
+                )
+            key = key or legacy_key
             if not key:
                 raise RuntimeError("LIGHTER_PRIVATE_KEY / API_KEY_PRIVATE_KEY not set")
             client = SignerClient(

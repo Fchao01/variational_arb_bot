@@ -29,6 +29,7 @@ import asyncio
 import json
 import logging
 import os
+from pathlib import Path
 import sys
 import uuid
 from decimal import Decimal
@@ -221,7 +222,7 @@ async def variational_flow(args: argparse.Namespace) -> None:
 
 
 async def main() -> None:
-    load_dotenv()
+    load_dotenv(Path(__file__).resolve().parents[1] / ".env")
     args = parse_args()
     logging.basicConfig(level=logging.WARNING)
 

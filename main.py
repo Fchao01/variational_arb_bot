@@ -15,10 +15,18 @@ Tunables split in two:
     HL/warmup/floor, RFQ pacing.
 """
 
+from pathlib import Path
+
 from dotenv import load_dotenv
 
-from arb_bot.app import main
-
 if __name__ == "__main__":
-    load_dotenv()
+    env_path = Path(__file__).resolve().parent / ".env"
+    load_dotenv(env_path)
+    print(
+        f"Environment file: {env_path} "
+        f"({'found' if env_path.is_file() else 'missing; using process environment'})",
+        flush=True,
+    )
+    from arb_bot.app import main
+
     main()

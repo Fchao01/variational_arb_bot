@@ -75,6 +75,13 @@ cp .env.example .env
 
 RH 与 Lighter Core 主网是独立部署，不能复用主网的账户、API key、市场 ID 或资金。
 
+程序只加载仓库根目录的 `.env`，不会搜索父目录的配置。启动会显示该文件
+路径，以及实际使用的 RH REST/WS 地址和签名 chain id（不会打印私钥）。
+`LIGHTER_PRIVATE_KEY` 是 Lighter 的 API 私钥，不是钱包私钥；它必须与 RH 上的
+账户索引、API key 索引配套。不要同时留下值不同的旧 `API_KEY_PRIVATE_KEY`，
+程序会拒绝这种配置。进程已有的环境变量优先于 `.env`，修改凭据后需重启进程；
+若仍然读到旧凭据，检查启动脚本或服务管理器中是否设置了同名环境变量。
+
 如需在 Lighter WebSocket 新旧逻辑切换期间临时强制使用旧的应用层 ping/pong，可设置：
 ```bash
 LIGHTER_WS_SERVER_PINGS=true

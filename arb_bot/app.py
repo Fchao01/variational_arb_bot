@@ -38,6 +38,8 @@ from arb_bot.config import (
     FORWARDER_REST_PORT,
     FORWARDER_WS_PORT,
     LIGHTER_BASE_URL,
+    LIGHTER_CHAIN_ID,
+    LIGHTER_WS_URL,
     LOG_DIR,
     POLL_INTERVAL_SECONDS,
     READY_TIMEOUT_SECONDS,
@@ -178,6 +180,11 @@ class App:
     async def run(self) -> None:
         signal.signal(signal.SIGINT, self._shutdown)
         signal.signal(signal.SIGTERM, self._shutdown)
+
+        self.log.info(
+            "Lighter deployment=RH REST=%s WS=%s signing_chain_id=%s",
+            LIGHTER_BASE_URL, LIGHTER_WS_URL, LIGHTER_CHAIN_ID,
+        )
 
         if self.recorder is not None:
             self.recorder.ensure_csv()
