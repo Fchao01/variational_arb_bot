@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from decimal import ROUND_HALF_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
 from typing import Any
 
 from arb_bot.helpers import parse_server_ts, resolve_lighter_ticker, to_decimal
@@ -97,6 +97,7 @@ class QuoteReader:
         min_interval_ms: float,
         logger: logging.Logger,
         lighter_book=None,
+        lighter_executor=None,
     ) -> None:
         self._command = command_client
         # notional is read per-RFQ so live_config can change it mid-session.
@@ -104,6 +105,9 @@ class QuoteReader:
         self._min_interval = min_interval_ms / 1000.0
         self._log = logger
         self.lighter_book = lighter_book
+        # Set by App after Lighter has loaded live market metadata. The
+        # executor supplies the size step so both legs use the same quantity.
+        self.lighter_executor = lighter_executor
 
         # Per-coin qty tick, learned from each indicative's qty_limits;
         # absent until the coin's first RFQ returns.
@@ -164,6 +168,22 @@ class QuoteReader:
         cached_tick = self._tick.get(coin.upper())
         had_tick = cached_tick is not None
         qty = _round_tick(raw_qty, cached_tick if had_tick else _DEFAULT_TICK)
+
+        # Lighter may support fewer size decimals than Variational. Align the
+        # RFQ quantity down to Lighter's base-size step before requesting the
+        # quote; otherwise the Var leg can be 0.0001 larger than the actual
+        # Lighter hedge (e.g. SOL 0.1097 vs 0.109).
+        market_cfg = (
+            self.lighter_executor.config(sym)
+            if self.lighter_executor is not None else None
+        )
+        if market_cfg is not None and market_cfg.base_mult > 0:
+            lighter_qty = (
+                (qty * market_cfg.base_mult)
+                .to_integral_value(rounding=ROUND_DOWN)
+                / Decimal(market_cfg.base_mult)
+            )
+            qty = lighter_qty
         if qty <= 0:
             return None
 

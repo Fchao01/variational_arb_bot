@@ -163,6 +163,10 @@ class App:
 
         if not self.record_only:
             self.lighter.load_market_configs(symbols)
+            # QuoteReader must size the Variational RFQ to the coarser of the
+            # two venues' quantity steps, otherwise Lighter truncates its leg
+            # and leaves a cross-venue size mismatch.
+            self.quotes.lighter_executor = self.lighter
             for sym in symbols:
                 market = self.lighter.config(sym)
                 if market is None:
